@@ -1,5 +1,7 @@
 from typing import Dict, List, Annotated
 import numpy as np
+from sklearn.cluster import KMeans
+import hnswlib  
 import os
 
 DB_SEED_NUMBER = 42
@@ -57,17 +59,22 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
     
-    def retrieve(self, query: Annotated[np.ndarray, (1, DIMENSION)], top_k = 5):
-        scores = []
-        num_records = self._get_num_records()
-        # here we assume that the row number is the ID of each vector
-        for row_num in range(num_records):
-            vector = self.get_one_row(row_num)
-            score = self._cal_score(query, vector)
-            scores.append((score, row_num))
-        # here we assume that if two rows have the same score, return the lowest ID
-        scores = sorted(scores, reverse=True)[:top_k]
-        return [s[1] for s in scores]
+    def retrieve(self, query: np.ndarray, top_k=5):
+        # Step 1: Identify nearest clusters
+        cluster_ids = np.argsort(
+            np.linalg.norm(self.cluster_manager.centroids - query, axis=1)
+        )[:5]  # Top 5 clusters
+    
+        # Step 2: Retrieve candidates from clusters
+        results = []
+        for cluster_id in cluster_ids:
+            cluster_results = self.hnsw_indices[cluster_id].query(query, k=top_k)
+            results.extend([(self._cal_score(query, self.get_one_row(idx)), idx) for idx in cluster_results])
+    
+        # Step 3: Rank and return top-k
+        results.sort(reverse=True)
+        return [idx for _, idx in results[:top_k]]
+
     
     def _cal_score(self, vec1, vec2):
         dot_product = np.dot(vec1, vec2)
@@ -77,7 +84,43 @@ class VecDB:
         return cosine_similarity
 
     def _build_index(self):
-        # Placeholder for index building logic
-        pass
+        # Load all vectors
+        vectors = self.get_all_rows()
+        self.cluster_manager = ClusterManager(num_clusters=10000, dimension=DIMENSION)
+        self.cluster_manager.cluster_vectors(vectors)
+        # Create an HNSW graph for each cluster
+        self.hnsw_indices = {i: HNSWIndex(DIMENSION) for i in range(self.cluster_manager.num_clusters)}
+        for cluster_id in range(self.cluster_manager.num_clusters):
+            cluster_vectors = vectors[self.cluster_manager.assignments == cluster_id]
+            self.hnsw_indices[cluster_id].build(cluster_vectors)
 
+class ClusterManager:
+    def __init__(self, num_clusters: int, dimension: int):
+        self.num_clusters = None  # This will be set later based on the data size
+        self.dimension = dimension
+        self.kmeans = None
+        self.centroids = None
+        self.assignments = None
 
+    def cluster_vectors(self, vectors: np.ndarray) -> None:
+        # Adjust the number of clusters to be at most the number of vectors
+        self.num_clusters = min(len(vectors), 10000)
+        self.kmeans = KMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, n_init=10)  
+        self.assignments = self.kmeans.fit_predict(vectors)
+        self.centroids = self.kmeans.cluster_centers_
+
+    def assign_to_cluster(self, vector: np.ndarray) -> int:
+        return np.argmin(np.linalg.norm(self.centroids - vector, axis=1))
+
+class HNSWIndex:
+    def __init__(self, dimension: int, max_elements=1000, ef_construction=100, m=8):
+        self.dimension = dimension
+        self.index = hnswlib.Index(space='cosine', dim=dimension)
+        self.index.init_index(max_elements=max_elements, ef_construction=ef_construction, M=m)
+    
+    def build(self, vectors: np.ndarray):
+        self.index.add_items(vectors)
+    
+    def query(self, vector: np.ndarray, k: int) -> List[int]:
+        labels, distances = self.index.knn_query(vector, k=k)
+        return labels[0]
