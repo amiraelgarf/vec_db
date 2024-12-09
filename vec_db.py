@@ -1,8 +1,9 @@
 from typing import Dict, List, Annotated
 import numpy as np
-from sklearn.cluster import KMeans
+from sklearn.cluster import MiniBatchKMeans
 import hnswlib  
 import os
+from joblib import Parallel, delayed
 
 DB_SEED_NUMBER = 42
 ELEMENT_SIZE = np.dtype(np.float32).itemsize
@@ -23,6 +24,7 @@ class VecDB:
     def generate_database(self, size: int) -> None:
         rng = np.random.default_rng(DB_SEED_NUMBER)
         vectors = rng.random((size, DIMENSION), dtype=np.float32)
+        vectors = self._normalize_vectors(vectors)  # Precompute normalized vectors
         self._write_vectors_to_file(vectors)
         self._build_index()
 
@@ -35,6 +37,7 @@ class VecDB:
         return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
 
     def insert_records(self, rows: Annotated[np.ndarray, (int, 70)]):
+        rows = self._normalize_vectors(rows)
         num_old_records = self._get_num_records()
         num_new_records = len(rows)
         full_shape = (num_old_records + num_new_records, DIMENSION)
@@ -43,6 +46,9 @@ class VecDB:
         mmap_vectors.flush()
         #TODO: might change to call insert in the index, if you need
         self._build_index()
+
+    def _normalize_vectors(self, vectors: np.ndarray) -> np.ndarray:
+        return vectors / np.linalg.norm(vectors, axis=1, keepdims=True)
 
     def get_one_row(self, row_num: int) -> np.ndarray:
         # This function is only load one row in memory
@@ -59,68 +65,66 @@ class VecDB:
         vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
         return np.array(vectors)
     
-    def retrieve(self, query: np.ndarray, top_k=5):
-        # Step 1: Identify nearest clusters
-        cluster_ids = np.argsort(
-            np.linalg.norm(self.cluster_manager.centroids - query, axis=1)
-        )[:5]  # Top 5 clusters
-    
-        # Step 2: Retrieve candidates from clusters
+    def retrieve(self, query: np.ndarray, top_k=5) -> List[int]:
+        query = self._normalize_vectors(np.array([query]))[0]
+        cluster_ids = np.argsort(np.linalg.norm(self.cluster_manager.centroids - query, axis=1))[:max(3, top_k // 2)]
+        
         results = []
         for cluster_id in cluster_ids:
-            cluster_results = self.hnsw_indices[cluster_id].query(query, k=top_k)
-            results.extend([(self._cal_score(query, self.get_one_row(idx)), idx) for idx in cluster_results])
-    
-        # Step 3: Rank and return top-k
+            if cluster_id in self.hnsw_indices:
+                cluster_results = self.hnsw_indices[cluster_id].query(query, k=top_k)
+                results.extend([(self._cal_score(query, self.get_one_row(idx)), idx) for idx in cluster_results])
+        
         results.sort(reverse=True)
         return [idx for _, idx in results[:top_k]]
 
     
-    def _cal_score(self, vec1, vec2):
-        dot_product = np.dot(vec1, vec2)
-        norm_vec1 = np.linalg.norm(vec1)
-        norm_vec2 = np.linalg.norm(vec2)
-        cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
-        return cosine_similarity
+    def _cal_score(self, vec1: np.ndarray, vec2: np.ndarray) -> float:
+        return np.dot(vec1, vec2)  # Cosine similarity as vectors are normalized
 
-    def _build_index(self):
-        # Load all vectors
+
+    def _build_index(self) -> None:
         vectors = self.get_all_rows()
-        self.cluster_manager = ClusterManager(num_clusters=10000, dimension=DIMENSION)
+        self.cluster_manager = ClusterManager(num_clusters=min(len(vectors), int(np.sqrt(len(vectors)))), dimension=DIMENSION)
         self.cluster_manager.cluster_vectors(vectors)
-        # Create an HNSW graph for each cluster
-        self.hnsw_indices = {i: HNSWIndex(DIMENSION) for i in range(self.cluster_manager.num_clusters)}
-        for cluster_id in range(self.cluster_manager.num_clusters):
-            cluster_vectors = vectors[self.cluster_manager.assignments == cluster_id]
-            self.hnsw_indices[cluster_id].build(cluster_vectors)
 
+        cluster_vectors = {i: [] for i in range(self.cluster_manager.num_clusters)}
+        for idx, cluster_id in enumerate(self.cluster_manager.assignments):
+            cluster_vectors[cluster_id].append(vectors[idx])
+
+        self.hnsw_indices = {}
+        results = Parallel(n_jobs=-1)(
+            delayed(self._build_hnsw_for_cluster)(cluster_id, np.array(cluster_vectors[cluster_id]))
+            for cluster_id in cluster_vectors if len(cluster_vectors[cluster_id]) > 0
+        )
+        self.hnsw_indices = {res[0]: res[1] for res in results}
+    
+    def _build_hnsw_for_cluster(self, cluster_id: int, vectors: np.ndarray):
+        hnsw_index = HNSWIndex(DIMENSION)
+        hnsw_index.build(vectors)
+        return cluster_id, hnsw_index
 class ClusterManager:
     def __init__(self, num_clusters: int, dimension: int):
-        self.num_clusters = None  # This will be set later based on the data size
+        self.num_clusters = num_clusters
         self.dimension = dimension
         self.kmeans = None
         self.centroids = None
         self.assignments = None
 
     def cluster_vectors(self, vectors: np.ndarray) -> None:
-        # Adjust the number of clusters to be at most the number of vectors
-        self.num_clusters = min(len(vectors), 10000)
-        self.kmeans = KMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, n_init=10)  
+        self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024)
         self.assignments = self.kmeans.fit_predict(vectors)
         self.centroids = self.kmeans.cluster_centers_
 
-    def assign_to_cluster(self, vector: np.ndarray) -> int:
-        return np.argmin(np.linalg.norm(self.centroids - vector, axis=1))
 
 class HNSWIndex:
-    def __init__(self, dimension: int, max_elements=1000, ef_construction=100, m=8):
-        self.dimension = dimension
+    def __init__(self, dimension: int, max_elements=1000, ef_construction=50, m=16):
         self.index = hnswlib.Index(space='cosine', dim=dimension)
         self.index.init_index(max_elements=max_elements, ef_construction=ef_construction, M=m)
-    
-    def build(self, vectors: np.ndarray):
+
+    def build(self, vectors: np.ndarray) -> None:
         self.index.add_items(vectors)
-    
+
     def query(self, vector: np.ndarray, k: int) -> List[int]:
-        labels, distances = self.index.knn_query(vector, k=k)
+        labels, _ = self.index.knn_query(vector, k=k)
         return labels[0]
