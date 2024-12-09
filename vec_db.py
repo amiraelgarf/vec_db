@@ -1,6 +1,7 @@
 from typing import Dict, List, Annotated
 import numpy as np
-from sklearn.cluster import MiniBatchKMeans
+#from sklearn.cluster import MiniBatchKMeans
+from sklearn.cluster import KMeans
 import hnswlib  
 import os
 from joblib import Parallel, delayed
@@ -85,38 +86,72 @@ class VecDB:
 
     def _build_index(self) -> None:
         vectors = self.get_all_rows()
-        self.cluster_manager = ClusterManager(num_clusters=min(len(vectors), int(np.sqrt(len(vectors)))), dimension=DIMENSION)
+        self.cluster_manager = ClusterManager(
+            num_clusters=max(1, min(len(vectors), int(np.sqrt(len(vectors) / 2)))),
+            dimension=DIMENSION
+        )
         self.cluster_manager.cluster_vectors(vectors)
 
         cluster_vectors = {i: [] for i in range(self.cluster_manager.num_clusters)}
         for idx, cluster_id in enumerate(self.cluster_manager.assignments):
             cluster_vectors[cluster_id].append(vectors[idx])
 
+        # Balance clusters
+        cluster_vectors = self._balance_clusters(cluster_vectors)
+
+        # Build HNSW indices
         self.hnsw_indices = {}
-        results = Parallel(n_jobs=-1)(
-            delayed(self._build_hnsw_for_cluster)(cluster_id, np.array(cluster_vectors[cluster_id]))
-            for cluster_id in cluster_vectors if len(cluster_vectors[cluster_id]) > 0
-        )
-        self.hnsw_indices = {res[0]: res[1] for res in results}
-    
-    def _build_hnsw_for_cluster(self, cluster_id: int, vectors: np.ndarray):
-        hnsw_index = HNSWIndex(DIMENSION)
-        hnsw_index.build(vectors)
-        return cluster_id, hnsw_index
+        for cluster_id, cluster_vecs in cluster_vectors.items():
+            if len(cluster_vecs) > 0:
+                hnsw_index = HNSWIndex(DIMENSION)
+                hnsw_index.build(np.array(cluster_vecs))
+                self.hnsw_indices[cluster_id] = hnsw_index
+
+    def _balance_clusters(self, cluster_vectors):
+        threshold = 10  
+        balanced_vectors = {}
+        small_clusters = []
+
+        for cluster_id, vecs in cluster_vectors.items():
+            if len(vecs) < threshold:
+                small_clusters.extend(vecs)
+            else:
+                balanced_vectors[cluster_id] = vecs
+
+        # Assign small clusters to the nearest large cluster
+        if small_clusters:
+            for vec in small_clusters:
+                # Find the nearest cluster (simple dot-product similarity for demonstration)
+                closest_cluster = max(
+                    balanced_vectors.keys(),
+                    key=lambda cid: np.mean([np.dot(vec, cvec) for cvec in balanced_vectors[cid]])
+                )
+                balanced_vectors[closest_cluster].append(vec)
+
+        return balanced_vectors
+
+
+# class ClusterManager:
+#     def __init__(self, num_clusters: int, dimension: int):
+#         self.num_clusters = num_clusters
+#         self.dimension = dimension
+#         self.kmeans = None
+#         self.centroids = None
+#         self.assignments = None
+
+#     def cluster_vectors(self, vectors: np.ndarray) -> None:
+#         self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024)
+#         self.assignments = self.kmeans.fit_predict(vectors)
+#         self.centroids = self.kmeans.cluster_centers_
+
 class ClusterManager:
-    def __init__(self, num_clusters: int, dimension: int):
+    def __init__(self, num_clusters, dimension):
         self.num_clusters = num_clusters
         self.dimension = dimension
-        self.kmeans = None
-        self.centroids = None
-        self.assignments = None
+        self.kmeans = KMeans(n_clusters=self.num_clusters, random_state=42, n_init=10)  # Set n_init explicitly
 
-    def cluster_vectors(self, vectors: np.ndarray) -> None:
-        self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024)
+    def cluster_vectors(self, vectors):
         self.assignments = self.kmeans.fit_predict(vectors)
-        self.centroids = self.kmeans.cluster_centers_
-
-
 class HNSWIndex:
     def __init__(self, dimension: int, max_elements=1000, ef_construction=50, m=16):
         self.index = hnswlib.Index(space='cosine', dim=dimension)
