@@ -123,9 +123,11 @@ class VecDB:
     def _pq_search(self, codebook: np.ndarray, query: np.ndarray, top_k: int) -> List[tuple]:
         """Search within a PQ codebook for the nearest vectors."""
         quantized_query = self._quantize(codebook, query)
-        distances = np.linalg.norm(codebook - quantized_query, axis=1)
-        closest_indices = np.argsort(distances)[:top_k]
-        return [(idx, distances[idx]) for idx in closest_indices]
+        #compute similarity instead of euclidean distance
+        similarities = np.dot(codebook, quantized_query) / (np.linalg.norm(codebook, axis=1) * np.linalg.norm(quantized_query))
+        closest_indices = np.argsort(similarities)[-top_k:][::-1]
+    
+        return [(idx, similarities[idx]) for idx in closest_indices]
 
     def _quantize(self, codebook: np.ndarray, vector: np.ndarray) -> np.ndarray:
         """Quantize a vector to the nearest codebook entry."""
