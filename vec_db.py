@@ -134,7 +134,7 @@ class VecDB:
     def _train_pq_codebook(self, cluster_vectors: np.ndarray) -> np.ndarray:
         """Train a PQ codebook for a cluster."""
         num_clusters = min(len(cluster_vectors), 256)
-        kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=DB_SEED_NUMBER)
+        kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=DB_SEED_NUMBER, max_iter=500, tol=1e-4)
         kmeans.fit(cluster_vectors)
         return kmeans.cluster_centers_
 
@@ -183,6 +183,6 @@ class ClusterManager:
 
     def cluster_vectors(self, vectors: np.ndarray) -> None:
         """Cluster vectors using MiniBatchKMeans."""
-        self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024)
+        self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024, max_iter=300, tol=1e-4)
         self.assignments = self.kmeans.fit_predict(vectors)
         self.centroids = self.kmeans.cluster_centers_
