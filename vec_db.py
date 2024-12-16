@@ -190,7 +190,7 @@ class VecDB:
         except IndexError as e:
             print(f"Error in reconstructing vectors: {e}")
             raise
-
+        query = query.flatten()
         # Calculate scores for each vector against the query using `_cal_score`
         scores = [self._cal_score(reconstructed_vec, query) for reconstructed_vec in reconstructed_vectors]
 
