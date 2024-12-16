@@ -1,5 +1,6 @@
 # This snippet of code is to show you a simple evaluate for VecDB class, but the full evaluation for project on the Notebook shared with you.
 import numpy as np
+import csv
 from vec_db import VecDB
 import time
 from dataclasses import dataclass
@@ -54,7 +55,7 @@ def eval(results: List[Result]):
 
 
 if __name__ == "__main__":
-    db = VecDB(db_size = 10**2)
+    db = VecDB(db_size = 10**6)
 
     all_db = db.get_all_rows()
 
