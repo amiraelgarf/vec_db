@@ -1,144 +1,157 @@
-import os
 import numpy as np
+import os
+import struct
 from sklearn.cluster import MiniBatchKMeans
-from typing import Dict, List, Annotated
+from typing import Annotated
 
+# Constants
+DIMENSION = 64
+ELEMENT_SIZE = 4  # float32 is 4 bytes
 DB_SEED_NUMBER = 42
-ELEMENT_SIZE = np.dtype(np.float32).itemsize
-DIMENSION = 70
-
 
 class VecDB:
-    def __init__(self, database_file_path="saved_db_1m.dat", index_file_path="saved_db_1m", new_db=True, db_size=None) -> None:
+    # -------------------------------------------------------------------------
+    # 1. STRICT INIT SIGNATURE (Do not change this)
+    # -------------------------------------------------------------------------
+    def __init__(self, database_file_path="saved_db.dat", index_file_path="index.dat",
+                 new_db=True, db_size=None) -> None:
         self.db_path = database_file_path
         self.index_path = index_file_path
-        self.cluster_manager = None
-        self.pq_codebooks = {}  # For Product Quantization
-        self.last_indexed_row = 0 
-
-        # Ensure the index directory exists
-        os.makedirs(self.index_path, exist_ok=True)
 
         if new_db:
             if db_size is None:
                 raise ValueError("You need to provide the size of the database")
-            if os.path.exists(self.db_path):
-                os.remove(self.db_path)
+
+            # Clean up old files
+            if os.path.exists(self.db_path): os.remove(self.db_path)
+            if os.path.exists(self.index_path): os.remove(self.index_path)
+
             self.generate_database(db_size)
         else:
-            self.load_indices()
+            # If we are loading an existing DB but the index is missing, build it.
+            if os.path.exists(self.db_path) and not os.path.exists(self.index_path):
+                print("[INIT] Database found but Index missing. Building Index...")
+                self._build_index()
 
+    # -------------------------------------------------------------------------
+    # 2. FILE OPERATIONS
+    # -------------------------------------------------------------------------
+    def get_one_row(self, row_num: int) -> np.ndarray:
+        try:
+            offset = row_num * DIMENSION * ELEMENT_SIZE
+            mmap_vector = np.memmap(self.db_path, dtype=np.float32, mode='r',
+                                    shape=(1, DIMENSION), offset=offset)
+            return np.array(mmap_vector[0])
+        except Exception as e:
+            return np.zeros(DIMENSION)
+
+    def get_all_rows(self) -> np.ndarray:
+        num_records = self._get_num_records()
+        vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
+        return np.array(vectors)
+
+    def _get_num_records(self) -> int:
+        if not os.path.exists(self.db_path): return 0
+        return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
+
+    # -------------------------------------------------------------------------
+    # 3. GENERATION & INDEXING
+    # -------------------------------------------------------------------------
     def generate_database(self, size: int) -> None:
+        print(f"[DB] Generating {size} vectors...")
         rng = np.random.default_rng(DB_SEED_NUMBER)
-        vectors = rng.random((size, DIMENSION), dtype=np.float32)
-        self._write_vectors_to_file(vectors)
-        self._build_index(full_rebuild=True)  # Full rebuild for a new database
 
-    def _write_vectors_to_file(self, vectors: np.ndarray) -> None:
-        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode="w+", shape=vectors.shape)
-        mmap_vectors[:] = vectors[:]
+        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='w+', shape=(size, DIMENSION))
+
+        chunk_size = 500_000
+        for i in range(0, size, chunk_size):
+            end = min(i + chunk_size, size)
+            mmap_vectors[i:end] = rng.random((end - i, DIMENSION), dtype=np.float32)
+            if i % 1_000_000 == 0: mmap_vectors.flush()
+
         mmap_vectors.flush()
+        print("[DB] Generation complete.")
+        self._build_index()
 
-    def load_indices(self) -> None:
-        centroids_path = os.path.join(self.index_path, "ivf_centroids.npy")
-        assignments_path = os.path.join(self.index_path, "ivf_assignments.npy")
+    def _build_index(self):
+        num_records = self._get_num_records()
+        print(f"[INDEX] Building Single-File Index for {num_records} vectors...")
 
-        if os.path.exists(centroids_path) and os.path.exists(assignments_path):
-            # Load centroids and assignments
-            centroids = np.load(centroids_path)
-            assignments = np.load(assignments_path)
+        # A. Determine clusters
+        if num_records <= 1_000_000: n_clusters = 1000
+        elif num_records <= 10_000_000: n_clusters = 3000
+        else: n_clusters = 4000
 
-            self.cluster_manager = ClusterManager(num_clusters=len(centroids), dimension=DIMENSION)
-            self.cluster_manager.centroids = centroids
-            self.cluster_manager.assignments = assignments
-        else:
-            raise FileNotFoundError("Centroids or assignments files not found.")
+        # B. Train K-Means (Subsampling)
+        print("[INDEX] Training K-Means...")
+        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
 
-        # Load cluster data for each cluster
-        self.pq_codebooks = {}
-        for cluster_id in np.unique(self.cluster_manager.assignments):
-            cluster_file = os.path.join(self.index_path, f"cluster_{cluster_id}.npz")
-            if os.path.exists(cluster_file):
-                cluster_data = np.load(cluster_file)
-                self.pq_codebooks[cluster_id] = {
-                    "ids": cluster_data["ids"],
-                    "codes": cluster_data["codes"],
-                    "codebook": cluster_data["codebook"]
-                }
-            else:
-                print(f"Warning: Cluster file for cluster {cluster_id} not found.")
+        kmeans = MiniBatchKMeans(n_clusters=n_clusters, batch_size=10000,
+                                 random_state=DB_SEED_NUMBER, n_init='auto')
 
+        train_size = min(500_000, num_records)
+        kmeans.fit(mmap_vectors[:train_size])
 
+        centroids = kmeans.cluster_centers_.astype(np.float32)
 
-    def _build_index(self, full_rebuild=False):
-        vectors = self.get_all_rows()
+        # C. Assign Vectors
+        print("[INDEX] Assigning vectors...")
+        batch_size = 100000
+        all_labels = np.zeros(num_records, dtype=np.int32)
 
-        if full_rebuild:
-            self.cluster_manager = ClusterManager(
-                num_clusters=max(1, min(len(vectors), int(np.sqrt(len(vectors) / 2)))), dimension=DIMENSION
-            )
-            self.cluster_manager.cluster_vectors(vectors)
+        for i in range(0, num_records, batch_size):
+            end = min(i + batch_size, num_records)
+            all_labels[i:end] = kmeans.predict(mmap_vectors[i:end])
 
-            # Save centroids and assignments to disk
-            centroids_path = os.path.join(self.index_path, "ivf_centroids.npy")
-            assignments_path = os.path.join(self.index_path, "ivf_assignments.npy")
-            np.save(centroids_path, self.cluster_manager.kmeans.cluster_centers_)
-            np.save(assignments_path, self.cluster_manager.assignments)
+        # D. Sort IDs
+        print("[INDEX] Sorting lists...")
+        sorted_indices = np.argsort(all_labels)
+        sorted_labels = all_labels[sorted_indices]
 
-            # Create codebooks and save IDs with PQ codes
-            for cluster_id in np.unique(self.cluster_manager.assignments):
-                cluster_vector_indices = np.where(self.cluster_manager.assignments == cluster_id)[0]
-                cluster_vectors = vectors[cluster_vector_indices]
+        # E. WRITE SINGLE INDEX FILE
+        # Format:
+        # [N_Clusters (int)]
+        # [Centroids (N*Dim floats)]
+        # [Offset_Table (N*2 ints -> start_byte, count)]
+        # [Inverted Lists (Integers...)]
 
-                # Train PQ codebook
-                codebook = self._train_pq_codebook(cluster_vectors)
-                pq_codes = np.array([self._quantize(codebook, vec) for vec in cluster_vectors])
+        print(f"[INDEX] Writing to {self.index_path}...")
+        with open(self.index_path, "wb") as f:
+            # 1. Write Header: Number of Clusters
+            f.write(struct.pack("I", n_clusters))
 
-                # Save cluster data: IDs, PQ codes, and codebook
-                cluster_data = {
-                    "ids": cluster_vector_indices,
-                    "codes": pq_codes,
-                    "codebook": codebook
-                }
-                cluster_file = os.path.join(self.index_path, f"cluster_{cluster_id}.npz")
-                np.savez_compressed(cluster_file, **cluster_data)
-        else:
-            # Incremental indexing
-            new_vectors = vectors[self.last_indexed_row:]
-            if len(new_vectors) == 0:
-                return  # Nothing to index
+            # 2. Write Centroids
+            f.write(centroids.tobytes())
 
-            new_assignments = self.cluster_manager.kmeans.predict(new_vectors)
+            # 3. Reserve space for Offset Table
+            # Each entry is 2 ints (start_offset, count) -> 8 bytes
+            table_offset_start = f.tell()
+            f.write(b'\0' * (n_clusters * 8))
 
-            # Update assignments
-            self.cluster_manager.assignments = np.concatenate(
-                [self.cluster_manager.assignments, new_assignments]
-            )
+            # 4. Write Inverted Lists & Record Offsets
+            cluster_metadata = [] # Stores (offset, count)
 
-            # Process each affected cluster
-            for cluster_id in np.unique(new_assignments):
-                # Combine existing and new vectors for this cluster
-                cluster_vector_indices = np.where(self.cluster_manager.assignments == cluster_id)[0]
-                cluster_vectors = vectors[cluster_vector_indices]
+            for cid in range(n_clusters):
+                # Find range in sorted array
+                start_idx = np.searchsorted(sorted_labels, cid, side='left')
+                end_idx = np.searchsorted(sorted_labels, cid, side='right')
 
-                # Train PQ codebook
-                codebook = self._train_pq_codebook(cluster_vectors)
-                pq_codes = np.array([self._quantize(codebook, vec) for vec in cluster_vectors])
+                count = end_idx - start_idx
+                current_file_pos = f.tell()
 
-                # Save updated cluster data
-                cluster_data = {
-                    "ids": cluster_vector_indices,
-                    "codes": pq_codes,
-                    "codebook": codebook
-                }
-                cluster_file = os.path.join(self.index_path, f"cluster_{cluster_id}.npz")
-                np.savez_compressed(cluster_file, **cluster_data)
+                # Store metadata (Where this list starts, How many items)
+                cluster_metadata.append((current_file_pos, count))
 
-                # Update PQ codebook in memory
-                self.pq_codebooks[cluster_id] = codebook
+                if count > 0:
+                    ids = sorted_indices[start_idx:end_idx].astype(np.int32)
+                    f.write(ids.tobytes())
 
-            self.last_indexed_row = len(vectors)
+            # 5. Go back and fill in the Offset Table
+            f.seek(table_offset_start)
+            for offset, count in cluster_metadata:
+                f.write(struct.pack("II", offset, count))
 
+        print("[INDEX] Done.")
 
     # -------------------------------------------------------------------------
     # 4. RETRIEVAL (Batch-Optimized, Memory-Controlled)
@@ -251,76 +264,3 @@ class VecDB:
         # Sort by score descending
         top_heap.sort(key=lambda x: x[0], reverse=True)
         return [vid for score, vid in top_heap]
-
-    def _pq_search(self, codes: np.ndarray, query: np.ndarray, top_k: int, codebook: np.ndarray) -> List[tuple]:
-        # Reconstruct vectors using the codebook
-        try:
-            reconstructed_vectors = np.array([codebook[code] for code in codes])
-        except IndexError as e:
-            print(f"Error in reconstructing vectors: {e}")
-            raise
-        query = query.flatten()
-        # Calculate scores for each vector against the query using `_cal_score`
-        scores = [self._cal_score(reconstructed_vec, query) for reconstructed_vec in reconstructed_vectors]
-
-        # Get the top-k indices with the highest similarity scores
-        top_indices = np.argsort(scores)[-top_k:][::-1]
-
-        # Return the top-k results as tuples of (index, similarity score)
-        return [(idx, scores[idx]) for idx in top_indices]
-
-
-
-
-
-    def _quantize(self, codebook: np.ndarray, vector: np.ndarray) -> int:
-        return int(np.argmin(np.linalg.norm(codebook - vector, axis=1)))
-
-
-    def _train_pq_codebook(self, cluster_vectors: np.ndarray) -> np.ndarray:
-        num_clusters = min(len(cluster_vectors), 256)
-        kmeans = MiniBatchKMeans(n_clusters=num_clusters, random_state=DB_SEED_NUMBER)
-        kmeans.fit(cluster_vectors)
-        return kmeans.cluster_centers_
-
-
-    def get_all_rows(self) -> np.ndarray:
-        # Take care this load all the data in memory
-        num_records = os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
-        return np.memmap(self.db_path, dtype=np.float32, mode="r", shape=(num_records, DIMENSION))
-    def get_one_row(self, row_num: int) -> np.ndarray:
-        # This function is only load one row in memory
-        try:
-            offset = int(row_num * DIMENSION * ELEMENT_SIZE)
-            mmap_vector = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(1, DIMENSION), offset=offset)
-            return np.array(mmap_vector[0])
-        except Exception as e:
-            raise RuntimeError(f"Failed to retrieve row {row_num}: {e}")
-    def _get_num_records(self) -> int:
-        return os.path.getsize(self.db_path) // (DIMENSION * ELEMENT_SIZE)
-    def insert_records(self, rows: Annotated[np.ndarray, (int, 70)]):
-        num_old_records = self._get_num_records()
-        num_new_records = len(rows)
-        full_shape = (num_old_records + num_new_records, DIMENSION)
-        mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r+', shape=full_shape)
-        mmap_vectors[num_old_records:] = rows
-        mmap_vectors.flush()
-        self._build_index()
-    def _cal_score(self, vec1, vec2):
-        dot_product = np.dot(vec1, vec2)
-        norm_vec1 = np.linalg.norm(vec1)
-        norm_vec2 = np.linalg.norm(vec2)
-        cosine_similarity = dot_product / (norm_vec1 * norm_vec2)
-        return cosine_similarity        
-class ClusterManager:
-    def __init__(self, num_clusters: int, dimension: int):
-        self.num_clusters = num_clusters
-        self.dimension = dimension
-        self.kmeans = None
-        self.centroids = None
-        self.assignments = None
-
-    def cluster_vectors(self, vectors: np.ndarray) -> None:
-        self.kmeans = MiniBatchKMeans(n_clusters=self.num_clusters, random_state=DB_SEED_NUMBER, batch_size=1024)
-        self.assignments = self.kmeans.fit_predict(vectors)
-        self.centroids = self.kmeans.cluster_centers_
