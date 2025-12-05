@@ -10,9 +10,6 @@ DIMENSION = 64
 ELEMENT_SIZE = 4  # float32 is 4 bytes
 DB_SEED_NUMBER = 42
 
-# Fixed number of probes for speed optimization
-N_PROBES = 5
-
 class VecDB:
     # -------------------------------------------------------------------------
     # 1. STRICT INIT SIGNATURE (Do not change this)
@@ -106,21 +103,19 @@ class VecDB:
         for i in range(0, num_records, batch_size):
             end = min(i + batch_size, num_records)
             all_labels[i:end] = kmeans.predict(mmap_vectors[i:end])
-        
-        # Aggressive cleanup after assignment
-        del kmeans
-        gc.collect()
 
         # D. Sort IDs
         print("[INDEX] Sorting lists...")
         sorted_indices = np.argsort(all_labels)
         sorted_labels = all_labels[sorted_indices]
-        
-        # Aggressive cleanup after sorting
-        del all_labels
-        gc.collect()
 
         # E. WRITE SINGLE INDEX FILE
+        # Format:
+        # [N_Clusters (int)]
+        # [Centroids (N*Dim floats)]
+        # [Offset_Table (N*2 ints -> start_byte, count)]
+        # [Inverted Lists (Integers...)]
+
         print(f"[INDEX] Writing to {self.index_path}...")
         with open(self.index_path, "wb") as f:
             # 1. Write Header: Number of Clusters
@@ -128,10 +123,9 @@ class VecDB:
 
             # 2. Write Centroids
             f.write(centroids.tobytes())
-            del centroids # Free large array immediately
-            gc.collect()
 
             # 3. Reserve space for Offset Table
+            # Each entry is 2 ints (start_offset, count) -> 8 bytes
             table_offset_start = f.tell()
             f.write(b'\0' * (n_clusters * 8))
 
@@ -139,20 +133,19 @@ class VecDB:
             cluster_metadata = [] # Stores (offset, count)
 
             for cid in range(n_clusters):
+                # Find range in sorted array
                 start_idx = np.searchsorted(sorted_labels, cid, side='left')
                 end_idx = np.searchsorted(sorted_labels, cid, side='right')
 
                 count = end_idx - start_idx
                 current_file_pos = f.tell()
+
+                # Store metadata (Where this list starts, How many items)
                 cluster_metadata.append((current_file_pos, count))
 
                 if count > 0:
                     ids = sorted_indices[start_idx:end_idx].astype(np.int32)
                     f.write(ids.tobytes())
-                    del ids
-                    
-            del sorted_indices, sorted_labels # Free last large arrays
-            gc.collect()
 
             # 5. Go back and fill in the Offset Table
             f.seek(table_offset_start)
@@ -160,80 +153,83 @@ class VecDB:
                 f.write(struct.pack("II", offset, count))
 
         print("[INDEX] Done.")
-        # Ensure all large arrays used during indexing are freed
-        del mmap_vectors
-        gc.collect()
 
     # -------------------------------------------------------------------------
-    # 4. RETRIEVAL (Optimized for Speed and Low RAM)
+    # 4. RETRIEVAL
     # -------------------------------------------------------------------------
     def retrieve(self, query: np.ndarray, top_k=5):
         query = query.reshape(-1).astype(np.float32)
+        # Handle the case where the query vector is zero (or close to it)
         q_norm = np.linalg.norm(query)
-        
-        # Fixed number of probes for consistent speed
-        n_probes = N_PROBES 
+        if q_norm < 1e-10:
+             # Cannot calculate similarity with a zero vector.
+             # Return a default set of IDs (e.g., first K IDs) or empty list.
+             # For simplicity, we will return an empty list.
+             return []
+
         num_records = self._get_num_records()
+        
+        # Adjust n_probes based on database size for better recall/speed trade-off
+        # A higher number of probes increases accuracy but decreases speed.
+        if num_records <= 1_000_000: n_probes = 10
+        elif num_records <= 10_000_000: n_probes = 8
+        else: n_probes = 5
 
         # --- A & B. Coarse Search (Metadata + Centroids) ---
         with open(self.index_path, "rb") as f:
-            # 1. Read N Clusters
             n_clusters = struct.unpack("I", f.read(4))[0]
-
-            # 2. Read Centroids
+            
+            # Read all centroids and cluster offset table
             centroid_bytes = f.read(n_clusters * DIMENSION * ELEMENT_SIZE)
             centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
-
-            # 3. Read Offset Table
             table_bytes = f.read(n_clusters * 8)
             cluster_table = np.frombuffer(table_bytes, dtype=np.uint32).reshape(n_clusters, 2)
             
-            # Coarse search calculation
+            # Calculate similarity to all centroids (Vectorized)
             c_norms = np.linalg.norm(centroids, axis=1)
-            dists = np.dot(centroids, query)
-            sims = dists / (c_norms * q_norm + 1e-10)
+            # Add a small epsilon to avoid division by zero for zero-norm vectors
+            sims = np.dot(centroids, query) / (c_norms * q_norm + 1e-10) 
+            
+            # Identify the n_probes closest clusters
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
             
-            # **CRITICAL RAM OPTIMIZATION: Delete ALL large intermediate arrays immediately**
-            del centroids, centroid_bytes, c_norms, dists, sims
-            gc.collect() 
+            del centroids, centroid_bytes, c_norms, sims # Free memory
 
-            # --- C. Fine Search (Using memmap for fast I/O) ---
-            import heapq
+            # --- C. Fine Search (Optimized Memory-Mapped Read) ---
             top_heap = [] 
             batch_size = 50000 
+            
+            # Map the entire vector database file into memory once for fast lookups.
+            # This is the most significant performance optimization for a sparse IVFPQ/IVF setup.
+            mmap_vectors = np.memmap(self.db_path, dtype=np.float32, mode='r', 
+                                    shape=(num_records, DIMENSION))
 
-            # 1. ACCELERATION STEP: Open the DB vectors using memmap ONCE
-            # This is the single biggest speed boost, replacing many slow seek/read calls.
-            db_mmap = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
-
-            # Process each cluster
             for cid in closest_clusters:
                 offset, count = cluster_table[cid]
-                if count == 0:  
-                    continue
+                if count == 0: continue
 
                 # Read vector IDs for this cluster (from index_path file 'f')
                 f.seek(int(offset))
                 ids_bytes = f.read(int(count) * 4)
                 row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
-                del ids_bytes # Delete bytes buffer
-
-                # Process vectors in small, low-RAM batches
+                
+                # The row_ids are non-contiguous. We must read them one by one, 
+                # but using the mmap_vectors array makes this lookup extremely fast.
+                
                 for batch_start in range(0, len(row_ids), batch_size):
                     batch_end = min(batch_start + batch_size, len(row_ids))
                     batch_ids = row_ids[batch_start:batch_end]
                     
-                    # --- DRAMATIC PERFORMANCE BOOST ---
-                    # Indexed access via memmap: FASTEST I/O method for scattered reads
-                    batch_vecs = db_mmap[batch_ids]
-                    
-                    # Compute scores for this batch (FAST: RAM-based vectorized math)
+                    # 1. Use the pre-computed Memory-Map for fast vector retrieval
+                    # This is equivalent to a fast, non-contiguous block read.
+                    batch_vecs = mmap_vectors[batch_ids] 
+
+                    # 2. Compute scores for this batch (FAST: RAM-based vectorized math)
                     vec_norms = np.linalg.norm(batch_vecs, axis=1)
                     dot_products = np.dot(batch_vecs, query)
                     batch_scores = dot_products / (vec_norms * q_norm + 1e-10)
                     
-                    # Update top-k heap (Heap is very fast)
+                    # 3. Update top-k heap
                     for idx, score in enumerate(batch_scores):
                         vid = int(batch_ids[idx])
                         if len(top_heap) < top_k:
@@ -241,18 +237,15 @@ class VecDB:
                         elif score > top_heap[0][0]:
                             heapq.heapreplace(top_heap, (score, vid))
                     
-                    # **CRITICAL RAM OPTIMIZATION: Delete batch arrays**
+                    # Free batch memory
                     del batch_vecs, vec_norms, dot_products, batch_scores
-                    
-                # Free row IDs for this cluster
-                del row_ids
             
-            # Close/Free the memory-mapped array view and metadata
-            del db_mmap, cluster_table, closest_clusters
-            gc.collect()
+            # Close the memory map
+            del mmap_vectors
+            gc.collect() # Optional: force garbage collection
 
-        # --- D. Extract Final Top K ---
-        if not top_heap: return []
+            # --- D. Extract Final Top K ---
+            if not top_heap: return []
             
-        top_heap.sort(key=lambda x: x[0], reverse=True)
-        return [vid for score, vid in top_heap]
+            top_heap.sort(key=lambda x: x[0], reverse=True)
+            return [vid for score, vid in top_heap]
