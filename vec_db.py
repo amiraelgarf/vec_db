@@ -198,7 +198,7 @@ class VecDB:
 
             # --- C. Fine Search (Optimized Memory-Mapped Read) ---
             top_heap = [] 
-            batch_size = 50000 
+            batch_size = 10000 
             
             # Map the entire vector database file into memory once for fast lookups.
             # This is the most significant performance optimization for a sparse IVFPQ/IVF setup.
