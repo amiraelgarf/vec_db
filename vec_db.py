@@ -164,7 +164,7 @@ class VecDB:
         # Determine n_probes (Kept from original)
         num_records = self._get_num_records()
         if num_records <= 1_000_000: n_probes = 5
-        else: n_probes = 10
+        else: n_probes = 5
 
         # --- A. Read Metadata from Index File ---
         with open(self.index_path, "rb") as f:
@@ -185,8 +185,9 @@ class VecDB:
             sims = dists / (c_norms * q_norm + 1e-10)
             closest_clusters = np.argsort(sims)[::-1][:n_probes]
             
-            # Free centroids memory
+            # RAM OPTIMIZATION: Delete ALL large intermediate arrays immediately
             del centroids, centroid_bytes, c_norms, dists, sims
+            gc.collect() # Force garbage collection after freeing the largest array (centroids)
 
             # --- C. Fine Search (Batch-Optimized) ---
             import heapq
@@ -194,6 +195,7 @@ class VecDB:
             batch_size = 10000  # Size of vector batch to load into RAM
 
             # Open the DB vectors using memmap ONCE for the fine search
+            num_records = self._get_num_records()
             db_mmap = np.memmap(self.db_path, dtype=np.float32, mode='r', shape=(num_records, DIMENSION))
 
             # Process each cluster
@@ -203,21 +205,19 @@ class VecDB:
                     continue
 
                 # Read vector IDs for this cluster
-                # Move index file pointer to the start of the ID list
+                # The ID list can be large, so we delete it after use.
                 f.seek(int(offset))
                 ids_bytes = f.read(int(count) * 4)
                 row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
+                del ids_bytes # Delete bytes buffer
 
                 # Process vectors in small batches
                 for batch_start in range(0, len(row_ids), batch_size):
                     batch_end = min(batch_start + batch_size, len(row_ids))
                     batch_ids = row_ids[batch_start:batch_end]
                     
-                    # --- OPTIMIZATION: Use memmap for indexed access ---
-                    # Directly fetch the vectors corresponding to batch_ids using memmap indexing.
-                    # This avoids the manual and error-prone db_file.seek/read logic.
+                    # Indexed access via memmap is efficient and low-RAM
                     batch_vecs = db_mmap[batch_ids]
-                    # --- END OPTIMIZATION ---
                     
                     # Compute scores for this batch
                     vec_norms = np.linalg.norm(batch_vecs, axis=1)
@@ -232,14 +232,14 @@ class VecDB:
                         elif score > top_heap[0][0]:
                             heapq.heapreplace(top_heap, (score, vid))
                     
-                    # Free batch memory
+                    # RAM OPTIMIZATION: Delete batch arrays
                     del batch_vecs, vec_norms, dot_products, batch_scores
                     
                 # Free row IDs for this cluster
                 del row_ids
             
-            # Close/Free the memory-mapped array
-            del db_mmap
+            # Close/Free the memory-mapped array view and metadata
+            del db_mmap, cluster_table, closest_clusters
             gc.collect()
 
         # --- D. Extract Final Top K (sorted by score descending) ---
