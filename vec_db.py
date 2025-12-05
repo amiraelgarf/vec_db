@@ -3,6 +3,7 @@ import os
 import struct
 from sklearn.cluster import MiniBatchKMeans
 from typing import Annotated
+import gc
 
 # Constants
 DIMENSION = 64
