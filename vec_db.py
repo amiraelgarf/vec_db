@@ -4,6 +4,7 @@ import struct
 from sklearn.cluster import MiniBatchKMeans
 from typing import Annotated
 import gc
+import heapq
 
 # Constants
 DIMENSION = 64
