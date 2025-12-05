@@ -140,48 +140,117 @@ class VecDB:
             self.last_indexed_row = len(vectors)
 
 
-    def retrieve(self, query: np.ndarray, top_k=5) -> List[int]:
-        # Load indices if not already loaded
-        if not self.cluster_manager or self.cluster_manager.centroids is None:
-            self.load_indices()
+    # -------------------------------------------------------------------------
+    # 4. RETRIEVAL (Batch-Optimized, Memory-Controlled)
+    # -------------------------------------------------------------------------
+    def retrieve(self, query: np.ndarray, top_k=5):
+        query = query.reshape(-1).astype(np.float32)  # Flatten to 1D
+        q_norm = np.linalg.norm(query)
+        ELEMENT_SIZE = 4 # Assuming float32 is 4 bytes
 
-        if self.cluster_manager.centroids is None or len(self.cluster_manager.centroids) == 0:
-            return []  # No clusters available
+        # Determine n_probes (Kept from original)
+        num_records = self._get_num_records()
+        if num_records <= 1_000_000: n_probes = 5
+        else: n_probes = 10
 
-        # Calculate cosine similarity between query and centroids
-        cluster_scores = [
-            (cluster_id, self._cal_score(query, centroid))
-            for cluster_id, centroid in enumerate(self.cluster_manager.centroids)
-        ]
+        # --- A. Read Metadata from Index File --- (Unchanged)
+        with open(self.index_path, "rb") as f:
+            # 1. Read N Clusters
+            n_clusters = struct.unpack("I", f.read(4))[0]
 
-        # Sort clusters by descending similarity
-        sorted_clusters = sorted(cluster_scores, key=lambda x: x[1], reverse=True)
-        cluster_ids = [cluster_id for cluster_id, _ in sorted_clusters[:max(3, top_k // 2)]]
+            # 2. Read Centroids
+            centroid_bytes = f.read(n_clusters * DIMENSION * 4)
+            centroids = np.frombuffer(centroid_bytes, dtype=np.float32).reshape(n_clusters, DIMENSION)
 
-        results = []
+            # 3. Read Offset Table (N * 2 ints)
+            table_bytes = f.read(n_clusters * 8)
+            cluster_table = np.frombuffer(table_bytes, dtype=np.uint32).reshape(n_clusters, 2)
 
-        # Search within the selected clusters
-        for cluster_id in cluster_ids:
-            cluster_file = os.path.join(self.index_path, f"cluster_{cluster_id}.npz")
-            if not os.path.exists(cluster_file):
-                continue  # Skip if cluster data is missing
+            # --- B. Coarse Search --- (Unchanged)
+            c_norms = np.linalg.norm(centroids, axis=1)
+            dists = np.dot(centroids, query)
+            sims = dists / (c_norms * q_norm + 1e-10)
+            closest_clusters = np.argsort(sims)[::-1][:n_probes]
+            
+            # Free centroids memory
+            del centroids, centroid_bytes, c_norms, dists, sims
 
-            # Load cluster data
-            cluster_data = np.load(cluster_file)
-            cluster_vector_ids = cluster_data["ids"]
-            cluster_codes = cluster_data["codes"]
-            codebook = cluster_data["codebook"]
+            # --- C. Fine Search (Batch-Optimized) ---
+            import heapq
+            top_heap = []  # Min-heap of size top_k
+            batch_size = 10000  # Size of vector batch to load into RAM
 
-            # Perform PQ-based search
-            pq_results = self._pq_search(cluster_codes, query, top_k, codebook)
-            for local_idx, similarity in pq_results:
-                global_id = cluster_vector_ids[local_idx]
-                results.append((global_id, similarity))
+            # Open the DB file ONCE for the fine search
+            with open(self.db_path, "rb") as db_file:
+                # Process each cluster
+                for cid in closest_clusters:
+                    offset, count = cluster_table[cid]
+                    if count == 0:  
+                        continue
 
-        # Sort final results by similarity
-        results.sort(reverse=True, key=lambda x: x[1])
-        return [idx for idx, _ in results[:top_k]]
+                    # Read vector IDs for this cluster
+                    # Move index file pointer to the start of the ID list
+                    f.seek(int(offset))
+                    ids_bytes = f.read(int(count) * 4)
+                    row_ids = np.frombuffer(ids_bytes, dtype=np.int32)
 
+                    # Process vectors in small batches
+                    for batch_start in range(0, len(row_ids), batch_size):
+                        batch_end = min(batch_start + batch_size, len(row_ids))
+                        batch_ids = row_ids[batch_start:batch_end]
+                        num_in_batch = len(batch_ids)
+
+                        # --- OPTIMIZATION START ---
+                        
+                        # 1. Determine the offsets for all vectors in this batch
+                        offsets = batch_ids * DIMENSION * ELEMENT_SIZE
+                        
+                        # 2. Sort the batch_ids and offsets by offset. 
+                        # This allows for sequential reading in the next step,
+                        # minimizing disk head movement (the biggest bottleneck).
+                        sorted_indices = np.argsort(offsets)
+                        sorted_offsets = offsets[sorted_indices]
+                        sorted_batch_ids = batch_ids[sorted_indices]
+
+                        # 3. Read vectors for the batch in a memory-frugal, I/O-efficient way
+                        batch_vecs = np.empty((num_in_batch, DIMENSION), dtype=np.float32)
+                        
+                        for i, (offset, vid) in enumerate(zip(sorted_offsets, sorted_batch_ids)):
+                            db_file.seek(int(offset))
+                            vec_bytes = db_file.read(DIMENSION * ELEMENT_SIZE)
+                            
+                            # We must preserve the original order for later correlation
+                            original_idx = np.where(batch_ids == vid)[0][0]
+                            batch_vecs[original_idx] = np.frombuffer(vec_bytes, dtype=np.float32)
+                            
+                        # --- OPTIMIZATION END ---
+                        
+                        # Compute scores for this batch
+                        vec_norms = np.linalg.norm(batch_vecs, axis=1)
+                        dot_products = np.dot(batch_vecs, query)
+                        batch_scores = dot_products / (vec_norms * q_norm + 1e-10)
+                        
+                        # Update top-k heap
+                        for idx, score in enumerate(batch_scores):
+                            vid = int(batch_ids[idx])
+                            if len(top_heap) < top_k:
+                                heapq.heappush(top_heap, (score, vid))
+                            elif score > top_heap[0][0]:
+                                heapq.heapreplace(top_heap, (score, vid))
+                        
+                        # Free batch memory
+                        del batch_vecs, vec_norms, dot_products, batch_scores
+                        
+                    # Free row IDs for this cluster
+                    del row_ids
+            
+        # --- D. Extract Final Top K (sorted by score descending) ---
+        if len(top_heap) == 0:
+            return []
+            
+        # Sort by score descending
+        top_heap.sort(key=lambda x: x[0], reverse=True)
+        return [vid for score, vid in top_heap]
 
     def _pq_search(self, codes: np.ndarray, query: np.ndarray, top_k: int, codebook: np.ndarray) -> List[tuple]:
         # Reconstruct vectors using the codebook
